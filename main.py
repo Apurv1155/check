@@ -30,9 +30,8 @@ from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.textinput import TextInput
-# Import Window from Kivy for setting orientation explicitly if needed, though buildozer.spec handles most cases
 from kivy.core.window import Window
-
+from kivy.logger import Logger # Use Kivy's logger for better integration with Buildozer logs
 
 # ---------------------------------------------------------------------------
 # Configuration constants
@@ -71,9 +70,6 @@ EMAIL_PASSWORD: str = os.environ.get("FACEAPP_PASS", "ytup bjrd pupf tuuj")
 SMTP_SERVER: str = "smtp.gmail.com"
 SMTP_PORT: int = 587
 
-# Simple logger helper (replace with logging module for production).
-Logger = print
-
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
@@ -104,32 +100,41 @@ class FaceApp(App):
         # writable directory for application data. This ensures persistence on Android.
         self._known_faces_dir = Path(self.user_data_dir) / "known_faces"
         ensure_dir(self._known_faces_dir)
-        Logger(f"[INFO] Known faces directory set to: {self._known_faces_dir}")
+        Logger.info(f"[INFO] Known faces directory set to: {self._known_faces_dir}")
 
         # Haar cascade for face detection.
-        # This XML file is part of OpenCV's data and is used to detect faces.
-        # When running on PC, ensure haarcascade_frontalface_default.xml is in the same directory
-        # as your Python script, or provide its full path.
-        cascade_path = "haarcascade_frontalface_default.xml"
-        if not Path(cascade_path).is_file():
-            # Fallback to OpenCV's default data path if not found locally, though it's best to include it.
-            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            Logger(f"[WARN] haarcascade_frontalface_default.xml not found locally. Attempting to load from OpenCV data path: {cascade_path}")
+        # Attempt to load from current directory first (for bundled APK assets)
+        # then fallback to OpenCV's default data path (for PC development/testing).
+        cascade_filename = "haarcascade_frontalface_default.xml"
+        
+        # In a Buildozer APK, files specified in `source.include_exts` are usually
+        # available in the app's root directory or via Kivy's `resource_find`.
+        # However, for simplicity and cross-platform (PC vs. Android) compatibility,
+        # we try the current directory and then OpenCV's data path.
+        cascade_path = Path(cascade_filename)
+        if not cascade_path.is_file():
+            # If not found in the current directory, try OpenCV's installed data path
+            cascade_path = Path(cv2.data.haarcascades) / cascade_filename
+            Logger.info(f"[INFO] '{cascade_filename}' not found in current directory. Attempting to load from OpenCV data path: {cascade_path}")
 
-        self.face_cascade = cv2.CascadeClassifier(cascade_path)
+        self.face_cascade = cv2.CascadeClassifier(str(cascade_path)) # Convert Path object to string
         
         # Critical check: if the cascade classifier fails to load, face detection won't work.
         if self.face_cascade.empty():
-            Logger(f"[ERROR] Failed to load Haar cascade classifier. "
-                   f"Path tried: {cascade_path}. "
-                   f"Please ensure 'haarcascade_frontalface_default.xml' is present and accessible, "
-                   f"and that opencv-python is correctly installed.")
-            # Raise a runtime error to halt execution if the cascade is missing/corrupted.
-            raise RuntimeError("Failed to load face cascade classifier. Exiting.")
-
+            Logger.error(f"[ERROR] Failed to load Haar cascade classifier. "
+                         f"Path tried: {cascade_path}. "
+                         f"Please ensure '{cascade_filename}' is present in your app's directory (for APK) "
+                         f"or in OpenCV's data path (for PC), and that opencv-python is correctly installed.")
+            # Instead of raising RuntimeError immediately, we prepare a message to display to the user.
+            self._display_fatal_error_and_exit(
+                "Critical Error: Face detection resources missing or corrupted. "
+                "Please ensure the app is installed correctly and has all required files."
+            )
+            return # Exit init if fatal error
+        
+        Logger.info("[INFO] Haar cascade classifier loaded successfully.")
 
         # Train recogniser on existing samples.
-        # This method loads existing face images and trains the LBPHFaceRecognizer.
         self.recognizer, self.label_map = self._train_recognizer()
 
         # State dictionaries to manage application flow and data.
@@ -148,7 +153,16 @@ class FaceApp(App):
         self.tick_icon: Optional[np.ndarray] = self._load_tick_icon()
 
         # Optional sound played upon successful attendance recording.
-        self.sound = SoundLoader.load(AUDIO_FILE) or None
+        try:
+            self.sound = SoundLoader.load(AUDIO_FILE)
+            if self.sound:
+                Logger.info(f"[INFO] Sound file '{AUDIO_FILE}' loaded successfully.")
+            else:
+                Logger.warning(f"[WARN] Sound file '{AUDIO_FILE}' could not be loaded. Check path and format.")
+        except Exception as e:
+            Logger.error(f"[ERROR] Error loading sound file '{AUDIO_FILE}': {e}")
+            self.sound = None
+
 
         # Threading primitives for managing the camera loop.
         self._stop_event = threading.Event() # Used to signal the camera thread to stop.
@@ -233,31 +247,33 @@ class FaceApp(App):
         self.register_btn.bind(on_press=self._register_popup)
         self.update_btn.bind(on_press=self._update_photos_popup)
 
-        # Open webcam. ALWAYS attempt to open camera index 1 (often front camera for mobile).
-        # On PC, camera index 0 is often the default webcam.
-        # For PC testing, you might need to try 0 or another index.
-        self.capture = cv2.VideoCapture(1) # Attempt to open camera index 1
-        if not self.capture.isOpened():
-            # If camera 1 fails, log the error and try camera 0 as a common fallback for PC.
-            # This specific change is for better PC debugging/testing compatibility.
-            Logger("[WARN] Could not open camera index 1. Attempting to open camera index 0 as fallback for PC testing.")
-            self.capture = cv2.VideoCapture(0)
+        # Open webcam. For mobile, specifically attempt to open camera index 1 (front camera).
+        # On PC, you might need to test 0 or other indices.
+        try:
+            self.capture = cv2.VideoCapture(1) # Attempt to open camera index 1 (often front camera on mobile)
             if not self.capture.isOpened():
-                raise RuntimeError("Cannot open any camera (neither index 1 nor 0). Please ensure camera is available and drivers are installed.")
-            else:
-                Logger("[INFO] Successfully opened camera at index 0.")
-        else:
-            Logger("[INFO] Successfully opened camera at index 1.")
+                Logger.warning("[WARN] Could not open camera index 1. Trying index 0 as fallback for PC development or other camera setups.")
+                self.capture = cv2.VideoCapture(0) # Fallback for PC testing or if camera 1 is unavailable
+            
+            if not self.capture.isOpened():
+                raise IOError("Failed to open any camera.")
+            Logger.info(f"[INFO] Successfully opened camera at index {self.capture.get(cv2.CAP_PROP_POS_FRAMES) or 'unknown'}.")
 
+            # Start a separate thread for camera capture and processing to keep UI responsive.
+            self.capture_thread = threading.Thread(
+                target=self._camera_loop, daemon=True, name="CameraThread"
+            )
+            self.capture_thread.start()
 
-        # Start a separate thread for camera capture and processing to keep UI responsive.
-        self.capture_thread = threading.Thread(
-            target=self._camera_loop, daemon=True, name="CameraThread"
-        )
-        self.capture_thread.start()
+            # Schedule UI texture updates at approximately 30 frames per second.
+            Clock.schedule_interval(self._update_texture, 1 / 30)
 
-        # Schedule UI texture updates at approximately 30 frames per second.
-        Clock.schedule_interval(self._update_texture, 1 / 30)
+        except IOError as e:
+            Logger.exception(f"[CRITICAL ERROR] Camera initialization failed: {e}")
+            self._display_fatal_error_and_exit(
+                "Critical Error: Failed to access camera. Please ensure camera permissions are granted and try again."
+            )
+            return None # Indicate build failed if camera not available
 
 
         return root
@@ -275,7 +291,27 @@ class FaceApp(App):
         if self.capture:
             self.capture.release()
 
-        Logger(f"[INFO] Application closed cleanly – {python_time_now()}")
+        Logger.info(f"[INFO] Application closed cleanly – {python_time_now()}")
+
+    def _display_fatal_error_and_exit(self, message: str):
+        """Displays a fatal error message in a popup and then stops the Kivy app."""
+        content = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(10))
+        content.add_widget(Label(text=message, halign='center', valign='middle', color=(1,0,0,1)))
+        
+        dismiss_btn = Button(text="Exit App", size_hint=(1, None), height=dp(40))
+        content.add_widget(dismiss_btn)
+
+        popup = Popup(
+            title="Application Error",
+            content=content,
+            size_hint=(0.9, 0.4),
+            auto_dismiss=False,
+            pos_hint={'center_x': 0.5, 'center_y': 0.5}
+        )
+        dismiss_btn.bind(on_press=self.stop) # Bind button to stop the app
+        popup.open()
+        Logger.critical(f"[FATAL] Displayed fatal error to user: {message}")
+
 
     # ------------------------------------------------------------------
     # UI helpers
@@ -380,10 +416,17 @@ class FaceApp(App):
         Returns None if the file is not found, preventing crashes.
         """
         if not Path(TICK_ICON_PATH).is_file():
-            Logger(f"[WARN] Tick icon '{TICK_ICON_PATH}' missing – overlay disabled.")
+            Logger.warning(f"[WARN] Tick icon '{TICK_ICON_PATH}' missing – overlay disabled.")
             return None
         # IMREAD_UNCHANGED ensures alpha channel is read if present.
-        return cv2.imread(TICK_ICON_PATH, cv2.IMREAD_UNCHANGED)
+        try:
+            icon = cv2.imread(TICK_ICON_PATH, cv2.IMREAD_UNCHANGED)
+            if icon is None:
+                Logger.warning(f"[WARN] Could not read image file '{TICK_ICON_PATH}'. Check file integrity.")
+            return icon
+        except Exception as e:
+            Logger.error(f"[ERROR] Error loading tick icon '{TICK_ICON_PATH}': {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Camera capture + recognition thread
@@ -397,7 +440,7 @@ class FaceApp(App):
         while not self._stop_event.is_set(): # Loop until stop event is set
             ret, frame = self.capture.read() # Read a frame from the camera
             if not ret:
-                Logger("[WARN] Failed to read frame from camera. Retrying...")
+                Logger.warning("[WARN] Failed to read frame from camera. Retrying...")
                 time.sleep(0.1) # Small delay before trying again
                 continue  # Skip invalid frames.
 
@@ -412,7 +455,7 @@ class FaceApp(App):
             try:
                 faces = self.face_cascade.detectMultiScale(gray_small, scaleFactor=1.1, minNeighbors=5)
             except cv2.error as e:
-                Logger(f"[ERROR] OpenCV error in detectMultiScale: {e}. This might indicate a corrupted cascade file or an issue with your OpenCV installation.")
+                Logger.error(f"[ERROR] OpenCV error in detectMultiScale: {e}. This might indicate a corrupted cascade file or an issue with your OpenCV installation.")
                 faces = [] # Treat as no faces detected if an error occurs.
 
 
@@ -423,15 +466,27 @@ class FaceApp(App):
                 ]
 
                 # Extract the Face Region of Interest (ROI) and convert to grayscale for recognition.
+                # Ensure ROI is valid before processing
+                if y_full < 0 or y_full + h_full > frame.shape[0] or \
+                   x_full < 0 or x_full + w_full > frame.shape[1]:
+                    Logger.warning(f"[WARN] Detected face ROI is out of bounds. Skipping this detection. ROI: ({x_full},{y_full},{w_full},{h_full})")
+                    continue
+                
                 face_roi = cv2.cvtColor(
                     frame[y_full : y_full + h_full, x_full : x_full + w_full], cv2.COLOR_BGR2GRAY
                 )
+
+                # Check if face_roi is empty after slicing
+                if face_roi.size == 0:
+                    Logger.warning("[WARN] Empty face ROI after cropping. Skipping recognition for this frame.")
+                    continue
+
                 try:
                     # Predict the label (person ID) and confidence for the detected face.
                     label, conf = self.recognizer.predict(face_roi)
                 except Exception as e:
                     # If prediction fails, treat as unknown. This can happen if recognizer is not trained.
-                    Logger(f"[WARN] Face recognition prediction failed: {e}. Treating as unknown.")
+                    Logger.warning(f"[WARN] Face recognition prediction failed: {e}. Treating as unknown.")
                     label, conf = -1, 1000  # Unknown label, high confidence (meaning low match).
 
                 name, emp_id = self.label_map.get(label, ("unknown", ""))
@@ -532,19 +587,25 @@ class FaceApp(App):
                 # Expected format: name_empID_NNN.jpg
                 parts = file.split("_")
                 if len(parts) < 3:
-                    Logger(f"[WARN] Skipping file with unexpected filename format: {file}")
+                    Logger.warning(f"[WARN] Skipping file with unexpected filename format: {file}")
                     continue
                 name = "_".join(parts[:-2]).lower() # Rejoin parts in case name has underscores
                 emp_id = parts[-2].upper() # Employee ID is second to last part
                 # The last part is the sample number with extension, which we don't need for name/id
             except ValueError:
-                Logger(f"[WARN] Skipping unrecognised filename format: {file}")
+                Logger.warning(f"[WARN] Skipping unrecognised filename format: {file}")
                 continue
 
             img_path = self._known_faces_dir / file
-            img_gray = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+            img_gray = None
+            try:
+                img_gray = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+            except Exception as e:
+                Logger.error(f"[ERROR] Error reading image '{img_path}': {e}. Skipping.")
+                continue
+
             if img_gray is None:
-                Logger(f"[WARN] Could not read image: {img_path}. Skipping.")
+                Logger.warning(f"[WARN] Could not read image: {img_path}. Skipping.")
                 continue # Skip if image cannot be read.
 
             # Resize image to a consistent size (200x200) for training.
@@ -573,15 +634,15 @@ class FaceApp(App):
             try:
                 # Train the recognizer if there are images available.
                 recogniser.train(images, np.array(labels))
-                Logger(
+                Logger.info(
                     f"[INFO] Trained recogniser on {len(images)} images across {len(label_map)} identities."
                 )
             except cv2.error as e:
-                Logger(f"[ERROR] OpenCV error during recognizer training: {e}. This might indicate insufficient samples or corrupted data.")
+                Logger.error(f"[ERROR] OpenCV error during recognizer training: {e}. This might indicate insufficient samples or corrupted data.")
                 recogniser = cv2.face.LBPHFaceRecognizer_create() # Re-initialize empty recognizer
                 label_map = {} # Clear label map
         else:
-            Logger("[INFO] No images found – recogniser disabled until first registration.")
+            Logger.info("[INFO] No images found – recogniser disabled until first registration.")
 
         return recogniser, label_map
 
@@ -615,7 +676,7 @@ class FaceApp(App):
             emp_id = id_input.text.strip().upper()
             email = email_input.text.strip()
             if not (name and emp_id and email and "@" in email):
-                Logger("[WARN] Invalid input for registration.")
+                Logger.warning("[WARN] Invalid input for registration.")
                 self._show_status_message("Please fill all fields correctly!", 2, (1, 0, 0, 1))
                 return
 
@@ -647,7 +708,7 @@ class FaceApp(App):
             """Handles the next step in the update photos flow (OTP or email registration)."""
             emp_id = emp_input.text.strip().upper()
             if not emp_id:
-                Logger("[WARN] Employee ID cannot be empty for update.")
+                Logger.warning("[WARN] Employee ID cannot be empty for update.")
                 self._show_status_message("Employee ID cannot be empty!", 2, (1, 0, 0, 1))
                 return
             email = self.user_emails.get(emp_id)
@@ -659,7 +720,7 @@ class FaceApp(App):
                     break
             
             if name_existing is None:
-                Logger(f"[WARN] Employee ID {emp_id} not found in known faces. Cannot update.")
+                Logger.warning(f"[WARN] Employee ID {emp_id} not found in known faces. Cannot update.")
                 self._show_status_message("Employee ID not found. Please register first.", 3, (1, 0, 0, 1))
                 popup.dismiss()
                 return
@@ -696,7 +757,7 @@ class FaceApp(App):
                 popup.dismiss()
                 self._send_otp_flow(emp_id, email, name) # Proceed to OTP.
             else:
-                Logger("[WARN] Invalid email format during registration.")
+                Logger.warning("[WARN] Invalid email format during registration.")
                 self._show_status_message("Invalid email format!", 2, (1, 0, 0, 1))
 
 
@@ -754,7 +815,7 @@ class FaceApp(App):
                 otp_input.text = ""
                 otp_input.hint_text = "Incorrect – try again"
                 self._show_status_message("Incorrect OTP. Try again!", 2, (1, 0, 0, 1))
-                Logger("[WARN] Incorrect OTP entered.")
+                Logger.warning("[WARN] Incorrect OTP entered.")
 
         def _resend(_):  # noqa: ANN001
             """Resends a new OTP."""
@@ -796,7 +857,7 @@ class FaceApp(App):
                     name = nm
                     break
         if name is None:
-            Logger("[ERROR] No name found for this Employee ID. This should not happen in update flow if checks pass.")
+            Logger.error("[ERROR] No name found for this Employee ID. This should not happen in update flow if checks pass.")
             Clock.schedule_once(lambda _dt: self._show_popup("Error", Label(text="Internal error: Employee name not found for capture."), size=(0.7, 0.4)))
             return # Exit if name is still None
 
@@ -808,7 +869,7 @@ class FaceApp(App):
         start_index = len(existing_files) # Start numbering new files from here.
         collected = 0 # Counter for successfully collected samples.
 
-        Logger(
+        Logger.info(
             f"[INFO] Starting sample capture for {emp_id} – target {count_target} faces (updating={updating})."
         )
 
@@ -852,27 +913,32 @@ class FaceApp(App):
                 # Construct a unique filename for the captured image.
                 filename = f"{name}_{emp_id}_{start_index + collected:03d}.jpg"
                 # Save the resized image to the internal storage directory.
-                cv2.imwrite(str(self._known_faces_dir / filename), face_img_resized)
-                collected += 1 # Increment collected count.
-                Logger(f"[INFO] Captured sample {collected}/{count_target} for {emp_id}")
-                
-                # Provide visual feedback on the UI that a photo was captured.
-                Clock.schedule_once(lambda _dt: self._flash_image_widget(), 0)
+                try:
+                    cv2.imwrite(str(self._known_faces_dir / filename), face_img_resized)
+                    collected += 1 # Increment collected count.
+                    Logger.info(f"[INFO] Captured sample {collected}/{count_target} for {emp_id}")
+                    
+                    # Provide visual feedback on the UI that a photo was captured.
+                    Clock.schedule_once(lambda _dt: self._flash_image_widget(), 0)
 
-                # Update status message with capture progress.
-                Clock.schedule_once(lambda _dt, msg=f"Captured {collected}/{count_target} photos...": self._show_status_message(msg, 0.5, (1, 1, 0, 1)), 0)
-                # Small delay to allow for head movement between samples for better training data.
-                time.sleep(0.2)
+                    # Update status message with capture progress.
+                    Clock.schedule_once(lambda _dt, msg=f"Captured {collected}/{count_target} photos...": self._show_status_message(msg, 0.5, (1, 1, 0, 1)), 0)
+                    # Small delay to allow for head movement between samples for better training data.
+                    time.sleep(0.2)
+                except Exception as e:
+                    Logger.error(f"[ERROR] Failed to save image {filename}: {e}. Skipping this sample.")
+                    self._show_status_message("Error saving photo. Check storage.", 1, (1, 0, 0, 1))
+                    time.sleep(0.5) # Longer delay on error
             else:
                 # If no face is detected, prompt the user to adjust position.
                 Clock.schedule_once(lambda _dt: self._show_status_message("No face detected. Please position yourself.", 0.5, (1, 0, 0, 1)), 0) # Red warning.
                 time.sleep(0.1) # Small delay.
 
 
-        Logger("[INFO] Capture complete – retraining recogniser…")
+        Logger.info("[INFO] Capture complete – retraining recogniser…")
         # Retrain the recognizer with the new/updated samples.
         self.recognizer, self.label_map = self._train_recognizer()
-        Logger("[INFO] Update finished.")
+        Logger.info("[INFO] Update finished.")
         # Display final completion message based on whether it was a registration or update.
         if updating:
             Clock.schedule_once(lambda _dt: self._show_status_message("Face updated!", 3, (0, 1, 0, 1)), 0)
@@ -886,12 +952,12 @@ class FaceApp(App):
 
     def _handle_successful_recognition(self, name: str, emp_id: str):
         """Handles a successful face recognition event, playing sound and submitting attendance."""
-        Logger(f"[INFO] Recognised {name} ({emp_id}) – submitting attendance…")
+        Logger.info(f"[INFO] Recognised {name} ({emp_id}) – submitting attendance…")
         if self.sound:
             try:
                 self.sound.play() # Play success sound.
             except Exception as e:
-                Logger(f"[WARN] Failed to play sound: {e}")
+                Logger.warning(f"[WARN] Failed to play sound: {e}")
 
         # Submit to Google Form in a new thread to prevent UI freezing.
         threading.Thread(
@@ -917,8 +983,8 @@ class FaceApp(App):
             "Referer": GOOGLE_FORM_VIEW_URL,
         }
         
-        Logger(f"[INFO] Attempting to submit attendance for {name} ({emp_id}) to URL: {GOOGLE_FORM_POST_URL}")
-        Logger(f"[INFO] Payload: {payload}")
+        Logger.info(f"[INFO] Attempting to submit attendance for {name} ({emp_id}) to URL: {GOOGLE_FORM_POST_URL}")
+        Logger.info(f"[INFO] Payload: {payload}")
         try:
             with requests.Session() as session:
                 resp = session.post(
@@ -931,22 +997,22 @@ class FaceApp(App):
             
             # Check for successful status codes (200 OK or 302 Found for redirect).
             if resp.status_code in (200, 302):
-                Logger("[INFO] Attendance submitted successfully to Google Form.")
+                Logger.info("[INFO] Attendance submitted successfully to Google Form.")
                 Clock.schedule_once(lambda _dt: self._show_status_message(f"Attendance submitted for {name.title()}!", 3, (0, 1, 0, 1)), 0)
             else:
-                Logger(
+                Logger.warning(
                     f"[WARN] Google Form submission returned status {resp.status_code}. "
                     f"Response: {resp.text[:200]}..." # Log part of the response for debugging.
                 )
                 Clock.schedule_once(lambda _dt: self._show_popup("Submission Warning", Label(text=f"Form submission failed (Status: {resp.status_code}). Please check console for details and verify form configuration."), size=(0.8, 0.5)))
         except requests.exceptions.Timeout:
-            Logger(f"[ERROR] Google Form submission timed out for {name} ({emp_id}).")
+            Logger.error(f"[ERROR] Google Form submission timed out for {name} ({emp_id}).")
             Clock.schedule_once(lambda _dt: self._show_popup("Submission Error", Label(text="Form submission timed out. Check network connection."), size=(0.8, 0.5)))
         except requests.exceptions.ConnectionError as exc:
-            Logger(f"[ERROR] Google Form submission connection error for {name} ({emp_id}): {exc}")
+            Logger.error(f"[ERROR] Google Form submission connection error for {name} ({emp_id}): {exc}")
             Clock.schedule_once(lambda _dt: self._show_popup("Submission Error", Label(text="Network error during form submission. Check internet connection."), size=(0.8, 0.5)))
         except requests.RequestException as exc:
-            Logger(f"[ERROR] An unexpected error occurred during form submission for {name} ({emp_id}): {exc}")
+            Logger.error(f"[ERROR] An unexpected error occurred during form submission for {name} ({emp_id}): {exc}")
             Clock.schedule_once(lambda _dt: self._show_popup("Submission Error", Label(text=f"An error occurred during form submission: {exc}"), size=(0.8, 0.5)))
 
 
@@ -975,18 +1041,18 @@ class FaceApp(App):
                 server.starttls() # Enable Transport Layer Security
                 server.login(EMAIL_ADDRESS, EMAIL_PASSWORD) # Log in to SMTP server
                 server.send_message(msg) # Send the email
-            Logger(f"[INFO] Sent OTP to {email}")
+            Logger.info(f"[INFO] Sent OTP to {email}")
             return True
         except smtplib.SMTPAuthenticationError as exc:
-            Logger(f"[ERROR] SMTP authentication error: {exc}. "
+            Logger.error(f"[ERROR] SMTP authentication error: {exc}. "
                    "Check EMAIL_ADDRESS and EMAIL_PASSWORD (especially for App Passwords for Gmail).")
             return False
         except smtplib.SMTPConnectError as exc:
-            Logger(f"[ERROR] SMTP connection error: {exc}. "
+            Logger.error(f"[ERROR] SMTP connection error: {exc}. "
                    "Check SMTP_SERVER and SMTP_PORT, and network connectivity.")
             return False
         except Exception as exc:
-            Logger(f"[ERROR] General SMTP error when sending OTP to {email}: {exc}")
+            Logger.error(f"[ERROR] General SMTP error when sending OTP to {email}: {exc}")
             return False
 
     # ------------------------------------------------------------------
@@ -1001,10 +1067,12 @@ class FaceApp(App):
                 with emails_file.open("r", encoding="utf-8") as f:
                     return json.load(f)
             except json.JSONDecodeError as exc:
-                Logger(f"[WARN] Invalid JSON in email storage: {exc}; starting fresh.")
+                Logger.warning(f"[WARN] Invalid JSON in email storage: {exc}; starting fresh.")
                 # It's good practice to back up or rename the corrupted file
                 # to prevent continuous errors if it's indeed corrupted.
                 # For this example, we'll just log and return empty.
+            except IOError as exc:
+                Logger.error(f"[ERROR] Error reading email storage file '{emails_file}': {exc}. Starting fresh.")
         return {}
 
     def _save_email(self, emp_id: str, email: str) -> None:
@@ -1014,7 +1082,7 @@ class FaceApp(App):
             with (self._known_faces_dir / "user_emails.json").open("w", encoding="utf-8") as f:
                 json.dump(self.user_emails, f, indent=2)
         except IOError as exc:
-            Logger(f"[ERROR] Failed to save user emails to file: {exc}")
+            Logger.error(f"[ERROR] Failed to save user emails to file: {exc}")
 
     # ------------------------------------------------------------------
     # Overlay helpers
@@ -1033,8 +1101,12 @@ class FaceApp(App):
         try:
             icon = cv2.resize(self.tick_icon, (tick_icon_size, tick_icon_size), interpolation=cv2.INTER_AREA)
         except cv2.error as e:
-            Logger(f"[ERROR] Failed to resize tick icon: {e}. Skipping overlay.")
+            Logger.error(f"[ERROR] Failed to resize tick icon: {e}. Skipping overlay.")
             return
+        except Exception as e:
+            Logger.error(f"[ERROR] Unexpected error during tick icon resize: {e}. Skipping overlay.")
+            return
+
 
         # Calculate position for the tick mark
         # Place it slightly to the right of the text, vertically centered with the text.
@@ -1062,20 +1134,21 @@ class FaceApp(App):
         # Check if the ROI is valid (i.e., not out of bounds causing a slice of different size)
         if roi.shape[0] == tick_icon_size and roi.shape[1] == tick_icon_size:
             if icon.shape[2] == 4:  # RGBA image – use alpha channel for blending
-                # Split icon into B, G, R, Alpha channels
                 b, g, r, a = cv2.split(icon)
-                # Create a 3-channel mask from the alpha channel
-                mask = cv2.merge((a, a, a)) / 255.0
+                mask = a / 255.0 # Use the alpha channel as a mask, normalized to 0-1
+                # Expand mask to 3 channels for element-wise multiplication with BGR image
+                mask_rgb = cv2.merge((mask, mask, mask)) 
+                
                 # Blend the ROI with the icon using the mask
-                blended = (roi * (1 - mask) + cv2.merge((b, g, r)) * mask).astype(np.uint8)
+                blended = (roi * (1 - mask_rgb) + cv2.merge((b, g, r)) * mask_rgb).astype(np.uint8)
                 frame[icon_y_start : icon_y_start + tick_icon_size, icon_x_start : icon_x_start + tick_icon_size] = blended
             else:
-                Logger("[WARN] Tick icon is not RGBA; cannot perform alpha blending for tick next to name. Simple copy used.")
+                Logger.warning("[WARN] Tick icon is not RGBA; cannot perform alpha blending for tick next to name. Simple copy used.")
                 # Fallback: simple copy if no alpha channel. Ensure it's BGR if original is not.
                 icon_to_place = cv2.cvtColor(icon, cv2.COLOR_BGRA2BGR) if icon.shape[2] == 4 else icon
                 frame[icon_y_start : icon_y_start + tick_icon_size, icon_x_start : icon_x_start + tick_icon_size] = icon_to_place
         else:
-            Logger(f"[WARN] ROI for tick icon is not the expected size. Skipping overlay. ROI shape: {roi.shape}")
+            Logger.warning(f"[WARN] ROI for tick icon is not the expected size. Skipping overlay. ROI shape: {roi.shape}")
 
 
 # ---------------------------------------------------------------------------
@@ -1087,11 +1160,13 @@ if __name__ == "__main__":
         FaceApp().run()
     except Exception as e:
         # This will catch any unhandled exceptions during Kivy app startup or main loop
-        # and print them to the console, which is crucial for debugging crashes on PC.
+        # and print them to the console, which is crucial for debugging crashes on PC/mobile.
         import traceback
-        Logger(f"[CRITICAL ERROR] Application crashed: {e}")
-        Logger("--- Full Traceback ---")
+        Logger.critical(f"[CRITICAL ERROR] Application crashed: {e}")
+        Logger.critical("--- Full Traceback ---")
         traceback.print_exc()
-        Logger("----------------------")
-        # You might want to display a simple error popup here too for the user,
-        # but for debugging, console output is primary.
+        Logger.critical("----------------------")
+        # For mobile, it's better to show a popup and then exit the app gracefully
+        # if a critical error occurs before the Kivy app fully starts.
+        # This part will be handled if the error occurs in FaceApp.__init__ or build().
+        # If the crash is later in a separate thread, logging is key.
