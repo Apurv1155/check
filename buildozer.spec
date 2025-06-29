@@ -1,3 +1,13 @@
+[buildozer]
+# (int) Log level (0 = error only, 1 = info, 2 = debug (full log))
+log_level = 2
+
+# (int) If set to 1, the app will be built in debug mode.
+# debug = 0 # Uncomment and set to 1 if you want to explicitly enable debug mode here.
+
+# (int) If set to 1, will warn you if you build as root
+warn_on_root = 1
+
 [app]
 
 # (str) Title of your application
@@ -21,7 +31,7 @@ source.include_exts = py,png,jpg,mp3,json,xml
 
 # (list) Application requirements
 # comma separated e.g. requirements = sqlite3,kivy
-requirements = python3,kivy,opencv,requests
+requirements = python3,kivy==2.0.0,opencv,requests
 
 # (str) The category of the application:
 # Available categories are:
@@ -44,7 +54,8 @@ android.minapi = 21
 android.archs = arm64-v8a, armeabi-v7a
 
 # (int) Set the orientation of the application (e.g. landscape, portrait)
-orientation = landscape # Set to landscape as requested
+# Set to landscape as requested
+orientation = landscape 
 
 # (int) Whether your application should be fullscreen or not
 fullscreen = 0 # Set to 0 for debugging, can be 1 for production
